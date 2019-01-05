@@ -155,6 +155,8 @@ struct vhost_virtqueue {
 	TAILQ_HEAD(, vhost_iotlb_entry) iotlb_list;
 	int				iotlb_cache_nr;
 	TAILQ_HEAD(, vhost_iotlb_entry) iotlb_pending_list;
+	uint64_t		kick_idx;
+
 } __rte_cache_aligned;
 
 /* Old kernels have no such macros defined */

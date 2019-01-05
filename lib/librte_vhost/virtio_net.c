@@ -303,7 +303,7 @@ static __rte_always_inline int
 fill_vec_buf_split(struct virtio_net *dev, struct vhost_virtqueue *vq,
 			 uint32_t avail_idx, uint16_t *vec_idx,
 			 struct buf_vector *buf_vec, uint16_t *desc_chain_head,
-			 uint32_t *desc_chain_len, uint8_t perm)
+			 uint32_t *desc_chain_len, uint8_t perm, uint16_t *nr_descs)
 {
 	uint16_t idx = vq->avail->ring[avail_idx & (vq->size - 1)];
 	uint16_t vec_id = *vec_idx;
@@ -314,6 +314,7 @@ fill_vec_buf_split(struct virtio_net *dev, struct vhost_virtqueue *vq,
 
 	*desc_chain_head = idx;
 
+        *nr_descs = 0;
 	if (vq->desc[idx].flags & VRING_DESC_F_INDIRECT) {
 		dlen = vq->desc[idx].len;
 		descs = (struct vring_desc *)(uintptr_t)
@@ -354,6 +355,7 @@ fill_vec_buf_split(struct virtio_net *dev, struct vhost_virtqueue *vq,
 			return -1;
 		}
 
+                *nr_descs = *nr_descs + 1;
 		if ((descs[idx].flags & VRING_DESC_F_NEXT) == 0)
 			break;
 
@@ -384,6 +386,7 @@ reserve_avail_buf_split(struct virtio_net *dev, struct vhost_virtqueue *vq,
 
 	uint16_t head_idx = 0;
 	uint32_t len = 0;
+	uint16_t desc_count = 0;
 
 	*num_buffers = 0;
 	cur_idx  = vq->last_avail_idx;
@@ -407,7 +410,7 @@ reserve_avail_buf_split(struct virtio_net *dev, struct vhost_virtqueue *vq,
 		if (unlikely(fill_vec_buf_split(dev, vq, cur_idx,
 						&vec_idx, buf_vec,
 						&head_idx, &len,
-						VHOST_ACCESS_RW) < 0))
+						VHOST_ACCESS_RW, &desc_count) < 0))
 			return -1;
 		len = RTE_MIN(len, size);
 		update_shadow_used_ring_split(vq, head_idx, len);
@@ -419,7 +422,7 @@ reserve_avail_buf_split(struct virtio_net *dev, struct vhost_virtqueue *vq,
 
 	*nr_vec = vec_idx;
 
-	return 0;
+	return desc_count;
 }
 
 static __rte_always_inline int
@@ -507,7 +510,7 @@ fill_vec_buf_packed(struct virtio_net *dev, struct vhost_virtqueue *vq,
 		if (unlikely(vec_id >= BUF_VECTOR_MAX))
 			return -1;
 
-		*desc_count += 1;
+		*desc_count = *desc_count + 1;
 		*buf_id = descs[avail_idx].id;
 
 		if (descs[avail_idx].flags & VRING_DESC_F_INDIRECT) {
@@ -759,6 +762,30 @@ out:
 	return error;
 }
 
+typedef struct {
+        uint64_t nr_desc;
+        uint64_t nr_buf;
+        uint64_t desc_tsc;
+        uint64_t data_tsc;
+        uint64_t flush_tsc;
+        uint64_t kick_tsc;
+        uint64_t when;
+        uint64_t kick_idx;
+        uint64_t tx; 
+        uint64_t rx; 
+        uint64_t tx_desc;
+        uint64_t tx_desc_tsc;
+        uint64_t tx_data_tsc;
+        uint64_t tx_flush_tsc;
+        uint64_t tx_kick_tsc;
+}virtio_dev_log;
+
+#define DEV_LOG 1000000
+static virtio_dev_log dev_log[2][DEV_LOG];
+//static uint32_t rx_dev_log_idx[2];
+static uint32_t tx_dev_log_idx[2];
+static uint64_t dev_when[2];
+
 static __rte_always_inline uint32_t
 virtio_dev_rx_split(struct virtio_net *dev, struct vhost_virtqueue *vq,
 	struct rte_mbuf **pkts, uint32_t count)
@@ -767,24 +794,40 @@ virtio_dev_rx_split(struct virtio_net *dev, struct vhost_virtqueue *vq,
 	uint16_t num_buffers;
 	struct buf_vector buf_vec[BUF_VECTOR_MAX];
 	uint16_t avail_head;
+	uint64_t nr_buf_all = 0, nr_desc_all = 0, kick_idx;
+        int nr_desc;
+	uint64_t rx_start, rx_desc_end, rx_data_end, rx_flush_end, rx_kick_end;
+	uint16_t dev_idx;
+        virtio_dev_log *log;
+	uint32_t log_idx = 0;
 
-	avail_head = *((volatile uint16_t *)&vq->avail->idx);
+        if (dev == vhost_devices[0])
+            dev_idx = 0;
+        else
+            dev_idx = 1;
 
-	/*
-	 * The ordering between avail index and
-	 * desc reads needs to be enforced.
-	 */
-	rte_smp_rmb();
+        //log = &dev_log[dev_idx][rx_dev_log_idx[dev_idx]];
+        if ((tx_dev_log_idx[dev_idx]) >= 1)
+            log_idx = tx_dev_log_idx[dev_idx] - 1;
+        else 
+            log_idx = DEV_LOG - 1;
+
+        log = &dev_log[dev_idx][log_idx];
+
+        kick_idx = vq->kick_idx;
+        rx_start = rte_rdtsc();
 
 	rte_prefetch0(&vq->avail->ring[vq->last_avail_idx & (vq->size - 1)]);
+	avail_head = *((volatile uint16_t *)&vq->avail->idx);
 
 	for (pkt_idx = 0; pkt_idx < count; pkt_idx++) {
 		uint32_t pkt_len = pkts[pkt_idx]->pkt_len + dev->vhost_hlen;
 		uint16_t nr_vec = 0;
 
-		if (unlikely(reserve_avail_buf_split(dev, vq,
+                nr_desc = reserve_avail_buf_split(dev, vq,
 						pkt_len, buf_vec, &num_buffers,
-						avail_head, &nr_vec) < 0)) {
+						avail_head, &nr_vec);
+		if (unlikely(nr_desc < 0)) {
 			VHOST_LOG_DEBUG(VHOST_DATA,
 				"(%d) failed to get enough desc from vring\n",
 				dev->vid);
@@ -798,6 +841,8 @@ virtio_dev_rx_split(struct virtio_net *dev, struct vhost_virtqueue *vq,
 			dev->vid, vq->last_avail_idx,
 			vq->last_avail_idx + num_buffers);
 
+                nr_desc_all += nr_desc;
+                nr_buf_all += num_buffers;
 		if (copy_mbuf_to_desc(dev, vq, pkts[pkt_idx],
 						buf_vec, nr_vec,
 						num_buffers) < 0) {
@@ -807,14 +852,35 @@ virtio_dev_rx_split(struct virtio_net *dev, struct vhost_virtqueue *vq,
 
 		vq->last_avail_idx += num_buffers;
 	}
+        rx_desc_end = rte_rdtsc() - rx_start;
 
 	do_data_copy_enqueue(dev, vq);
 
+        rx_data_end = rte_rdtsc() - rx_desc_end - rx_start;
+
+        rx_flush_end = 0;
+        rx_kick_end = 0;
 	if (likely(vq->shadow_used_idx)) {
 		flush_shadow_used_ring_split(dev, vq);
-		vhost_vring_call_split(dev, vq);
-	}
+                rx_flush_end = rte_rdtsc() - rx_data_end - rx_start;
 
+		vhost_vring_call_split(dev, vq);
+
+                rx_kick_end = rte_rdtsc() - rx_flush_end - rx_start;
+                if (kick_idx != vq->kick_idx) {
+                    rx_kick_end |= (1ull << 63);
+                }
+        }
+
+        //log->tx = count;  /* count it in tx */
+        log->rx = pkt_idx;
+        log->kick_idx = vq->kick_idx;
+        log->nr_desc = nr_desc_all;
+        log->nr_buf = nr_buf_all;
+        log->desc_tsc = rx_desc_end;
+        log->data_tsc = rx_data_end;
+        log->flush_tsc = rx_flush_end;
+        log->kick_tsc = rx_kick_end;
 	return pkt_idx;
 }
 
@@ -825,7 +891,28 @@ virtio_dev_rx_packed(struct virtio_net *dev, struct vhost_virtqueue *vq,
 	uint32_t pkt_idx = 0;
 	uint16_t num_buffers;
 	struct buf_vector buf_vec[BUF_VECTOR_MAX];
+	uint64_t nr_buf_all = 0, nr_desc_all = 0, kick_idx;
+	uint64_t rx_start, rx_desc_end, rx_data_end, rx_flush_end, rx_kick_end;
+	uint16_t dev_idx;
+        virtio_dev_log *log;
+	uint32_t log_idx = 0;
 
+        if (dev == vhost_devices[0])
+            dev_idx = 0;
+        else
+            dev_idx = 1;
+
+        //log = &dev_log[dev_idx][rx_dev_log_idx[dev_idx]];
+        if ((tx_dev_log_idx[dev_idx]) >= 1)
+            log_idx = tx_dev_log_idx[dev_idx] - 1;
+        else 
+            log_idx = DEV_LOG - 1;
+
+        log = &dev_log[dev_idx][log_idx];
+        //log = &dev_log[dev_idx][rx_dev_log_idx[dev_idx]];
+
+        kick_idx = vq->kick_idx;
+        rx_start = rte_rdtsc();
 	for (pkt_idx = 0; pkt_idx < count; pkt_idx++) {
 		uint32_t pkt_len = pkts[pkt_idx]->pkt_len + dev->vhost_hlen;
 		uint16_t nr_vec = 0;
@@ -847,6 +934,8 @@ virtio_dev_rx_packed(struct virtio_net *dev, struct vhost_virtqueue *vq,
 			dev->vid, vq->last_avail_idx,
 			vq->last_avail_idx + num_buffers);
 
+                nr_desc_all += nr_descs;
+                nr_buf_all += num_buffers;
 		if (copy_mbuf_to_desc(dev, vq, pkts[pkt_idx],
 						buf_vec, nr_vec,
 						num_buffers) < 0) {
@@ -860,13 +949,35 @@ virtio_dev_rx_packed(struct virtio_net *dev, struct vhost_virtqueue *vq,
 			vq->avail_wrap_counter ^= 1;
 		}
 	}
+        rx_desc_end = rte_rdtsc() - rx_start;
 
 	do_data_copy_enqueue(dev, vq);
 
+        rx_data_end = rte_rdtsc() - rx_desc_end - rx_start;
+
+        rx_flush_end = 0;
+        rx_kick_end = 0;
 	if (likely(vq->shadow_used_idx)) {
 		flush_shadow_used_ring_packed(dev, vq);
+                rx_flush_end = rte_rdtsc() - rx_data_end - rx_start;
+
 		vhost_vring_call_packed(dev, vq);
-	}
+
+                rx_kick_end = rte_rdtsc() - rx_flush_end - rx_start;
+                if (kick_idx != vq->kick_idx) {
+                    rx_kick_end |= (1ull << 63);
+                }
+        }
+
+        //log->tx = count;
+        log->rx = pkt_idx;
+        log->kick_idx = kick_idx;
+        log->nr_desc = nr_desc_all;
+        log->nr_buf = nr_buf_all;
+        log->desc_tsc = rx_desc_end;
+        log->data_tsc = rx_data_end;
+        log->flush_tsc = rx_flush_end;
+        log->kick_tsc = rx_kick_end;
 
 	return pkt_idx;
 }
@@ -1322,13 +1433,29 @@ restore_mbuf(struct rte_mbuf *m)
 	}
 }
 
+static uint16_t watermark;
+//uint32_t batch_desc[2];
 static __rte_always_inline uint16_t
 virtio_dev_tx_split(struct virtio_net *dev, struct vhost_virtqueue *vq,
 	struct rte_mempool *mbuf_pool, struct rte_mbuf **pkts, uint16_t count)
 {
 	uint16_t i;
+	uint16_t desc_count;
+	uint32_t batch_desc = 0;
 	uint16_t free_entries;
+        virtio_dev_log *log;
+	uint64_t tx_start, tx_desc, tx_data, tx_flush, tx_kick;
+	uint16_t dev_idx;
 
+        if (dev == vhost_devices[0])
+            dev_idx = 1;
+        else
+            dev_idx = 0;
+
+        if (unlikely(!watermark))
+            watermark = MAX_PKT_BURST;;
+
+        log = &dev_log[dev_idx][tx_dev_log_idx[dev_idx]];
 	if (unlikely(dev->dequeue_zero_copy)) {
 		struct zcopy_mbuf *zmbuf, *next;
 
@@ -1353,6 +1480,8 @@ virtio_dev_tx_split(struct virtio_net *dev, struct vhost_virtqueue *vq,
 		}
 	}
 
+	rte_prefetch0(&vq->avail->ring[vq->last_avail_idx & (vq->size - 1)]);
+
 	free_entries = *((volatile uint16_t *)&vq->avail->idx) -
 			vq->last_avail_idx;
 	if (free_entries == 0)
@@ -1370,9 +1499,12 @@ virtio_dev_tx_split(struct virtio_net *dev, struct vhost_virtqueue *vq,
 
 	count = RTE_MIN(count, MAX_PKT_BURST);
 	count = RTE_MIN(count, free_entries);
+	count = RTE_MIN(count, watermark);
 	VHOST_LOG_DEBUG(VHOST_DATA, "(%d) about to dequeue %u buffers\n",
 			dev->vid, count);
 
+        dev_when[dev_idx]++;
+        tx_start = rte_rdtsc();
 	for (i = 0; i < count; i++) {
 		struct buf_vector buf_vec[BUF_VECTOR_MAX];
 		uint16_t head_idx;
@@ -1384,7 +1516,7 @@ virtio_dev_tx_split(struct virtio_net *dev, struct vhost_virtqueue *vq,
 						vq->last_avail_idx + i,
 						&nr_vec, buf_vec,
 						&head_idx, &dummy_len,
-						VHOST_ACCESS_RO) < 0))
+						VHOST_ACCESS_RO, &desc_count) < 0))
 			break;
 
 		if (likely(dev->dequeue_zero_copy == 0))
@@ -1428,18 +1560,49 @@ virtio_dev_tx_split(struct virtio_net *dev, struct vhost_virtqueue *vq,
 			vq->nr_zmbuf += 1;
 			TAILQ_INSERT_TAIL(&vq->zmbuf_list, zmbuf, next);
 		}
+
+                batch_desc += desc_count;
+#if 0
+                if (batch_desc >= watermark) {
+                    i++;
+                    break;
+                }
+#endif
 	}
 	vq->last_avail_idx += i;
 
-	if (likely(dev->dequeue_zero_copy == 0)) {
+        log->tx = 0;
+        memset(log, 0, sizeof(*log));
+        if (i > 0) {
+            log->when = dev_when[dev_idx];
+            log->tx = i;
+            tx_desc = rte_rdtsc();
+            log->tx_desc = batch_desc;
+            log->tx_desc_tsc = tx_desc - tx_start;
+        }
+
+        log->tx_data_tsc = log->tx_flush_tsc = log->tx_kick_tsc = 0;
+	if (i && likely(dev->dequeue_zero_copy == 0)) {
 		do_data_copy_dequeue(vq);
+                tx_data = rte_rdtsc();
+                log->tx_data_tsc = tx_data - tx_desc;
+
 		if (unlikely(i < count))
 			vq->shadow_used_idx = i;
 		if (likely(vq->shadow_used_idx)) {
 			flush_shadow_used_ring_split(dev, vq);
+                        tx_flush = rte_rdtsc();
+                        log->tx_flush_tsc = tx_flush - tx_data;
+
 			vhost_vring_call_split(dev, vq);
+                        tx_kick = rte_rdtsc();
+                        log->tx_kick_tsc = tx_kick - tx_flush;
+
+                        tx_dev_log_idx[dev_idx] = tx_dev_log_idx[dev_idx] + 1;
+                        if (unlikely(tx_dev_log_idx[dev_idx] >= DEV_LOG))
+                            tx_dev_log_idx[dev_idx] = 0;
 		}
-	}
+        }
 
 	return i;
 }
@@ -1449,6 +1612,21 @@ virtio_dev_tx_packed(struct virtio_net *dev, struct vhost_virtqueue *vq,
 	struct rte_mempool *mbuf_pool, struct rte_mbuf **pkts, uint16_t count)
 {
 	uint16_t i;
+	uint32_t batch_desc = 0;
+        virtio_dev_log *log;
+	uint64_t tx_start, tx_desc, tx_data, tx_flush, tx_kick;
+	uint16_t dev_idx;
+
+        if (dev == vhost_devices[0])
+            dev_idx = 1;
+        else
+            dev_idx = 0;
+
+        log = &dev_log[dev_idx][tx_dev_log_idx[dev_idx]];
+        if (unlikely(!watermark))
+            watermark = MAX_PKT_BURST;;
+
+	rte_prefetch0(&vq->desc_packed[vq->last_avail_idx]);
 
 	if (unlikely(dev->dequeue_zero_copy)) {
 		struct zcopy_mbuf *zmbuf, *next;
@@ -1480,9 +1658,11 @@ virtio_dev_tx_packed(struct virtio_net *dev, struct vhost_virtqueue *vq,
 	VHOST_LOG_DEBUG(VHOST_DATA, "(%d) %s\n", dev->vid, __func__);
 
 	count = RTE_MIN(count, MAX_PKT_BURST);
+	count = RTE_MIN(count, watermark);
 	VHOST_LOG_DEBUG(VHOST_DATA, "(%d) about to dequeue %u buffers\n",
 			dev->vid, count);
-
+        dev_when[dev_idx]++;
+        tx_start = rte_rdtsc();
 	for (i = 0; i < count; i++) {
 		struct buf_vector buf_vec[BUF_VECTOR_MAX];
 		uint16_t buf_id;
@@ -1546,15 +1726,46 @@ virtio_dev_tx_packed(struct virtio_net *dev, struct vhost_virtqueue *vq,
 			vq->last_avail_idx -= vq->size;
 			vq->avail_wrap_counter ^= 1;
 		}
+
+                batch_desc += desc_count;
+#if 0
+                if (batch_desc >= watermark) {
+                    i++;
+                    break;
+                }
+#endif
 	}
 
-	if (likely(dev->dequeue_zero_copy == 0)) {
+        memset(log, 0, sizeof(*log));
+        log->tx = 0;
+        if (i > 0) {
+            log->when = dev_when[dev_idx];
+            log->tx = i;
+            tx_desc = rte_rdtsc();
+            log->tx_desc = batch_desc;
+            log->tx_desc_tsc = tx_desc - tx_start;
+        }
+
+        log->tx_data_tsc = log->tx_flush_tsc = log->tx_kick_tsc = 0;
+	if (i && likely(dev->dequeue_zero_copy == 0)) {
 		do_data_copy_dequeue(vq);
+                tx_data = rte_rdtsc();
+                log->tx_data_tsc = tx_data - tx_desc;
+
 		if (unlikely(i < count))
 			vq->shadow_used_idx = i;
 		if (likely(vq->shadow_used_idx)) {
 			flush_shadow_used_ring_packed(dev, vq);
+                        tx_flush = rte_rdtsc();
+                        log->tx_flush_tsc = tx_flush - tx_data;
+
 			vhost_vring_call_packed(dev, vq);
+                        tx_kick = rte_rdtsc();
+                        log->tx_kick_tsc = tx_kick - tx_flush;
+
+                        tx_dev_log_idx[dev_idx] = tx_dev_log_idx[dev_idx] + 1;
+                        if (unlikely(tx_dev_log_idx[dev_idx] >= DEV_LOG))
+                            tx_dev_log_idx[dev_idx] = 0;
 		}
 	}
 
